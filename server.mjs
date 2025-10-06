@@ -26,20 +26,19 @@ app.post("/evaluate", async (req, res) => {
       return res.status(400).json({ error: "`photos` must be a non-empty array of URLs" });
     }
 
-    // 3) Optional reachability check
+    // 3) Optional reachability check (non-fatal if blocked by CDN)
     try {
       await fetch(photos[0], { method: "HEAD" });
     } catch (_) {
-      // ignore if HEAD blocked by CDN; not fatal
+      // ignore
     }
 
-       // 4) Preference-aware scoring (rule-based for now)
-
+    // 4) Preference-aware scoring (rule-based for now)
     // ---- CONFIG: edit these to your taste/market ----
     const PREFS = {
       female: {
         height_cm: { min: 172, target: 177, max: 182 }, // sweet spot
-        meas_target: { b: 82, w: 60, h: 88 },           // target digitals (edit)
+        meas_target: { b: 82, w: 60, h: 88 },           // target digitals
         meas_tolerance: { b: 6, w: 4, h: 6 }            // +/- range that still scores well
       },
       male: {
@@ -51,7 +50,7 @@ app.post("/evaluate", async (req, res) => {
     const GENDER = (gender || "female").toLowerCase().startsWith("m") ? "male" : "female";
     const P = PREFS[GENDER];
 
-    const clamp = (x, a=0, b=1) => Math.max(a, Math.min(b, x));
+    const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
 
     // Parse "82-60-88" → {b:82,w:60,h:88}
     const parseMeas = (mStr) => {
@@ -72,7 +71,7 @@ app.post("/evaluate", async (req, res) => {
       // bell bonus around target
       const span = (P.height_cm.max - P.height_cm.min) / 2;
       const t = P.height_cm.target;
-      const bonus = Math.exp(-Math.pow((x - t) / (span/2), 2)) * 0.15; // up to +0.15
+      const bonus = Math.exp(-Math.pow((x - t) / (span / 2), 2)) * 0.15; // up to +0.15
       return clamp(s + bonus);
     };
 
@@ -88,7 +87,7 @@ app.post("/evaluate", async (req, res) => {
       const sW = clamp(1 - dxW);
       const sH = clamp(1 - dxH);
       // emphasize waist a bit more
-      return clamp((sB + 1.2*sW + sH) / 3.2);
+      return clamp((sB + 1.2 * sW + sH) / 3.2);
     })();
 
     // Photo signals
@@ -101,7 +100,12 @@ app.post("/evaluate", async (req, res) => {
     const tinyNoise = (n % 100) / 10000; // 0..0.0099
 
     // Combine (weights you can tweak)
-    let confidence = 0.55 * measScore + 0.35 * heightScore(height_cm) + 0.10 * (photoCount > 0 ? 0.6 : 0) + photoCountBoost + tinyNoise;
+    let confidence =
+      0.55 * measScore +
+      0.35 * heightScore(height_cm) +
+      0.10 * (photoCount > 0 ? 0.6 : 0) +
+      photoCountBoost +
+      tinyNoise;
     confidence = clamp(confidence);
 
     // Decision thresholds (tweakable)
@@ -127,3 +131,11 @@ app.post("/evaluate", async (req, res) => {
     const details = `photos=${photos.length}, gender=${gender ?? "n/a"}, h=${height_cm ?? "n/a"}, age=${age ?? "n/a"}, meas=${measurements ?? "n/a"}`;
 
     return res.json({ decision, confidence, reason, details });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+const port = process.env.PORT || 10000;
+app.listen(port, () => console.log("Evaluator running on :" + port));
