@@ -3,38 +3,26 @@ import cors from "cors";
 import crypto from "crypto";
 import fetch from "node-fetch";
 
-/* =========================
-   ENV  (set these on Render)
-   ========================= */
-const KEY              = process.env.EVALUATOR_API_KEY;         // Bubble -> API auth
-const HF_KEY           = process.env.HUGGINGFACE_API_KEY;       // Hugging Face token
-const CLOUD_NAME       = process.env.CLOUDINARY_CLOUD_NAME;     // e.g., dphw7jvyg
+/* ========= ENV (Render → Settings → Environment) ========= */
+const KEY              = process.env.EVALUATOR_API_KEY;         // Bubble auth
+const HF_KEY           = process.env.HUGGINGFACE_API_KEY;       // hf_...
+const CLOUD_NAME       = process.env.CLOUDINARY_CLOUD_NAME;     // e.g. dphw7jvyg
 const CLOUD_API_KEY    = process.env.CLOUDINARY_API_KEY;
 const CLOUD_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 const ADMIN_TOKEN      = process.env.ADMIN_TOKEN || "CHANGE_ME";
-
-/* Optional: override automatic folder discovery with JSON array of folder names
-   Example: ["Reference Asian Females","Reference Black male","Reference Mixed Female"]
-*/
+/* Optional */
 const REFERENCE_FOLDERS_JSON = process.env.REFERENCE_FOLDERS_JSON || "";
+const HF_MODEL_ENV     = process.env.HF_MODEL || "";            // to force a specific model
 
-/* Optional: force a specific HF model via env (else we try a list) */
-const HF_MODEL_ENV = process.env.HF_MODEL || "";
-
-/* =========================
-   App
-   ========================= */
+/* ========= App ========= */
 const app = express();
 app.use(express.json({ limit: "8mb" }));
-app.use(cors({ origin: "*" })); // TODO: replace "*" with your Bubble domain(s) for production
+app.use(cors({ origin: "*" })); // tighten to your Bubble domain later
 
-/* =========================
-   Utilities
-   ========================= */
+/* ========= Utils ========= */
 const clamp = (x, a=0, b=1) => Math.max(a, Math.min(b, x));
 const basicAuth = "Basic " + Buffer.from(`${CLOUD_API_KEY}:${CLOUD_API_SECRET}`).toString("base64");
 
-// Parse "82-60-88" → {b:82,w:60,h:88}
 const parseMeas = (mStr) => {
   if (!mStr || typeof mStr !== "string") return null;
   const nums = mStr.match(/\d+(\.\d+)?/g);
@@ -54,22 +42,28 @@ const heightScoreFactory = ({min, target, max}) => (h) => {
   const x = Number(h);
   if (x <= min) return 0;
   if (x >= max) return 1;
-  let s = (x - min) / (max - min);                          // linear within range
+  let s = (x - min) / (max - min);
   const span = (max - min) / 2;
-  const bonus = Math.exp(-Math.pow((x - target) / (span/2), 2)) * 0.15; // bell around target
+  const bonus = Math.exp(-Math.pow((x - target) / (span/2), 2)) * 0.15;
   return clamp(s + bonus);
 };
 
-/* =========================
-   Embeddings + caches
-   ========================= */
-const embedCache = new Map(); // url -> Float32Array
-const clusters   = [];        // [{label, gender, urls:[...], vecs:[Float32Array]}]
+/* ========= Embeddings (HF) ========= */
+const embedCache = new Map();  // url -> Float32Array
+const clusters   = [];         // [{label, gender, urls:[...], vecs:[Float32Array]}]
 
-// Preferred models (fast & widely available first)
+// Reliable CLIP variants (we’ll try them in order)
 const HF_MODELS = [
-  HF_MODEL_ENV || "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
+  HF_MODEL_ENV || "sentence-transformers/clip-ViT-B-32",
+  "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
   "openai/clip-vit-base-patch32"
+];
+
+// We’ll try ALL three Inference API routes, because different accounts/regions enable different ones
+const HF_ROUTES = (modelId) => [
+  `https://api-inference.huggingface.co/pipeline/image-feature-extraction/${modelId}`,
+  `https://api-inference.huggingface.co/pipeline/feature-extraction/${modelId}`,
+  `https://api-inference.huggingface.co/models/${modelId}`
 ];
 
 async function fetchImageBuffer(url) {
@@ -79,7 +73,8 @@ async function fetchImageBuffer(url) {
   return Buffer.from(ab);
 }
 
-// HF may return [tokens][dim] or [dim]; average over tokens if nested
+// HF sometimes returns [tokens][dim]; average over tokens.
+// Sometimes it returns a single vector [dim].
 function poolToVector(jsonOut) {
   if (Array.isArray(jsonOut) && Array.isArray(jsonOut[0])) {
     const rows = jsonOut.length, cols = jsonOut[0].length;
@@ -94,20 +89,21 @@ function poolToVector(jsonOut) {
   return Float32Array.from(jsonOut);
 }
 
-// POST raw image bytes to a model endpoint and get features back
-async function hfEmbedBinary(modelId, buf) {
-  const resp = await fetch(`https://api-inference.huggingface.co/models/${modelId}`, {
+// Try a single (route, model) pair with warm-up
+async function tryEmbed(route, buf) {
+  const resp = await fetch(route, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${HF_KEY}`,
       "Content-Type": "application/octet-stream",
-      Accept: "application/json"
+      Accept: "application/json",
+      "X-Wait-For-Model": "true"
     },
     body: buf
   });
   if (!resp.ok) {
     const txt = await resp.text();
-    throw new Error(`hf_${resp.status}_${modelId}:${txt || "error"}`);
+    throw new Error(`hf_${resp.status}_${route}:${txt || "error"}`);
   }
   const data = await resp.json();
   return poolToVector(data);
@@ -118,26 +114,25 @@ async function getEmbedding(url) {
   if (!HF_KEY) throw new Error("HUGGINGFACE_API_KEY missing");
 
   const buf = await fetchImageBuffer(url);
+  let lastErr;
 
-  let lastErr, usedModel = null;
-  for (const mid of HF_MODELS) {
-    try {
-      const vec = await hfEmbedBinary(mid, buf);
-      embedCache.set(url, vec);
-      usedModel = mid;
-      // (Optional) you could log which model succeeded
-      return vec;
-    } catch (e) {
-      lastErr = e;
-      console.error("hf_try_fail", mid, e.message);
+  for (const model of HF_MODELS) {
+    const routes = HF_ROUTES(model);
+    for (const route of routes) {
+      try {
+        const vec = await tryEmbed(route, buf);
+        embedCache.set(url, vec);
+        return vec;
+      } catch (e) {
+        lastErr = e;
+        console.error("hf_try_fail", model, e.message);
+      }
     }
   }
-  throw lastErr || new Error("hf_all_models_failed");
+  throw lastErr || new Error("hf_all_endpoints_failed");
 }
 
-/* =========================
-   Cloudinary admin helpers
-   ========================= */
+/* ========= Cloudinary admin helpers ========= */
 async function listRootFolders() {
   const url = `https://api.cloudinary.com/v1_1/${CLOUD_NAME}/folders`;
   const r = await fetch(url, { headers: { Authorization: basicAuth } });
@@ -197,9 +192,7 @@ async function loadClusters() {
   console.log("Loaded clusters:", clusters.map(c => `${c.label}(${c.vecs.length})`).join(", "));
 }
 
-/* =========================
-   Admin endpoints
-   ========================= */
+/* ========= Admin endpoints ========= */
 app.get("/admin/reload_refs", async (req, res) => {
   if (req.query.token !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
   try {
@@ -214,28 +207,25 @@ app.get("/admin/reload_refs", async (req, res) => {
   }
 });
 
-/* Test one image embedding quickly (debug) */
+// test a single image quickly (debug)
 app.get("/admin/test_embed", async (req, res) => {
   if (req.query.token !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
   try {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: "missing ?url=" });
     const vec = await getEmbedding(url);
-    res.json({ ok: true, dim: vec.length, tried_models: HF_MODELS });
+    res.json({ ok: true, dim: vec.length, models_tried: HF_MODELS });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-/* Health */
+/* ========= Health ========= */
 app.get("/", (_, res) => res.send("OK"));
 
-/* =========================
-   Evaluate
-   ========================= */
+/* ========= Evaluate ========= */
 app.post("/evaluate", async (req, res) => {
   try {
-    // Auth from Bubble
     const auth = req.headers.authorization || "";
     if (!KEY || !auth.startsWith("Bearer ") || auth.slice(7) !== KEY) {
       return res.status(401).json({ error: "Unauthorized" });
@@ -246,7 +236,7 @@ app.post("/evaluate", async (req, res) => {
       return res.status(400).json({ error: "`photos` must be a non-empty array of URLs" });
     }
 
-    /* 1) Preferences (female: target/tolerance — male: height + band windows) */
+    // Preferences (female target/tolerance; male bands)
     const PREFS = {
       female: {
         height: { min: 172, target: 177, max: 182 },
@@ -254,16 +244,10 @@ app.post("/evaluate", async (req, res) => {
         meas_tol:    { b: 6,  w: 4,  h: 6  }
       },
       male: {
-        // cap at 191cm, sweet spot around 186
         height: { min: 182, target: 186, max: 191 },
-
-        // accepts slimmer high-fashion builds with an ideal window
         meas_bands: {
-          // Bust/Chest: accept 88–96; ideal 90–94
           b: { min: 88, ideal: [90, 94], max: 96 },
-          // Waist: accept 71–82; ideal 73–77
           w: { min: 71, ideal: [73, 77], max: 82 },
-          // Hips: accept 88–96; ideal 90–94
           h: { min: 88, ideal: [90, 94], max: 96 }
         }
       }
@@ -273,46 +257,39 @@ app.post("/evaluate", async (req, res) => {
     const P   = PREFS[GEN];
     const heightScore = heightScoreFactory(P.height);
 
-    /* 2) Measurements score (supports both styles) */
+    // Measurements score
     const m = parseMeas(measurements);
-
-    // band scoring for male: 0 at min/max, 1 inside ideal window
     const bandScore = (val, band) => {
       if (val == null || !band) return 0;
       const v = Number(val);
-      const { min, ideal, max } = band; // ideal=[low,high]
+      const { min, ideal, max } = band;
       if (v <= min || v >= max) return 0;
       if (v >= ideal[0] && v <= ideal[1]) return 1;
-      if (v < ideal[0]) return (v - min) / (ideal[0] - min);
+      if (v <  ideal[0]) return (v - min) / (ideal[0] - min);
       return (max - v) / (max - ideal[1]);
     };
-
     let measScore = 0;
     if (GEN === "male" && P.meas_bands && m) {
       const sB = bandScore(m.b, P.meas_bands.b);
       const sW = bandScore(m.w, P.meas_bands.w);
       const sH = bandScore(m.h, P.meas_bands.h);
-      // waist carries a touch more weight
-      measScore = clamp((sB + 1.3 * sW + sH) / 3.3);
-      // small lean bonus when all three are in/near the lower side of ideal
+      measScore = clamp((sB + 1.3*sW + sH) / 3.3);
       const leanBonus =
-        (m.w <= P.meas_bands.w.ideal[1] && m.b <= P.meas_bands.b.ideal[1] && m.h <= P.meas_bands.h.ideal[1])
-          ? 0.03 : 0;
+        (m.w <= P.meas_bands.w.ideal[1] && m.b <= P.meas_bands.b.ideal[1] && m.h <= P.meas_bands.h.ideal[1]) ? 0.03 : 0;
       measScore = clamp(measScore + leanBonus);
     } else if (m && P.meas_target && P.meas_tol) {
-      // female: target + tolerance
       const dxB = Math.abs(m.b - P.meas_target.b) / P.meas_tol.b;
       const dxW = Math.abs(m.w - P.meas_target.w) / P.meas_tol.w;
       const dxH = Math.abs(m.h - P.meas_target.h) / P.meas_tol.h;
       const sB = clamp(1 - dxB);
       const sW = clamp(1 - dxW);
       const sH = clamp(1 - dxH);
-      measScore = clamp((sB + 1.2 * sW + sH) / 3.2);
+      measScore = clamp((sB + 1.2*sW + sH) / 3.2);
     } else {
       measScore = 0;
     }
 
-    /* 3) Face similarity vs your reference clusters */
+    // Face similarity
     let faceScore = 0.5, faceCluster = "none", faceReason = "face similarity neutral";
     try {
       if (clusters.length) {
@@ -320,14 +297,12 @@ app.post("/evaluate", async (req, res) => {
           ? clusters.filter(c => c.gender === GEN || c.gender === "unknown")
           : clusters;
 
-        // embed applicant photos
         const photoVecs = [];
         for (const url of photos) {
           try { photoVecs.push(await getEmbedding(url)); }
           catch (e) { console.error("app_embed_fail", url, e.message); }
         }
 
-        // compare to reference vectors (max cosine)
         let maxSim = -1, bestLabel = "none";
         for (const pv of photoVecs) {
           for (const c of pool) {
@@ -338,7 +313,7 @@ app.post("/evaluate", async (req, res) => {
           }
         }
         if (maxSim >= -1) {
-          faceScore = clamp((maxSim + 1) / 2); // map -1..1 → 0..1
+          faceScore = clamp((maxSim + 1) / 2);
           faceCluster = bestLabel;
           if (faceScore >= 0.70) faceReason = "face matches reference look";
           else if (faceScore >= 0.55) faceReason = "some similarity to reference look";
@@ -353,16 +328,14 @@ app.post("/evaluate", async (req, res) => {
       faceScore = 0.5;
     }
 
-    /* 4) Photo count signals */
+    // Photo count + tiny noise
     const nPhotos = photos.length;
-    const photoBoost = clamp((nPhotos - 2) * 0.04, 0, 0.12); // +4% per photo beyond 2 (max +12%)
-
-    /* 5) Stable tiny noise to spread ties */
+    const photoBoost = clamp((nPhotos - 2) * 0.04, 0, 0.12);
     const hash = crypto.createHash("sha256").update(photos.join("|")).digest("hex");
     const n = parseInt(hash.slice(0, 6), 16);
     const tinyNoise = (n % 100) / 10000;
 
-    /* 6) Combine (weights — tune if you like) */
+    // Combine
     let confidence =
       0.40 * measScore +
       0.25 * heightScore(height_cm) +
@@ -370,13 +343,10 @@ app.post("/evaluate", async (req, res) => {
       0.05 * (nPhotos ? 0.6 : 0) +
       photoBoost +
       tinyNoise;
-
     confidence = clamp(confidence);
 
-    /* 7) Decision bands */
     const decision = confidence >= 0.70 ? "proceed" : confidence >= 0.45 ? "review" : "reject";
 
-    /* 8) Reasons (human readable) */
     const reasons = [];
     if (height_cm) {
       const hs = heightScore(height_cm);
@@ -397,23 +367,17 @@ app.post("/evaluate", async (req, res) => {
     const details = `photos=${nPhotos}, gender=${gender ?? "n/a"}, h=${height_cm ?? "n/a"}, age=${age ?? "n/a"}, meas=${measurements ?? "n/a"}`;
 
     return res.json({
-      decision,
-      confidence,
-      reason,
-      details,
+      decision, confidence, reason, details,
       face_similarity: Number(faceScore.toFixed(3)),
       face_cluster: faceCluster
     });
-
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "server_error", message: String(e?.message || e) });
   }
 });
 
-/* =========================
-   Boot
-   ========================= */
+/* ========= Boot ========= */
 const port = process.env.PORT || 10000;
 app.listen(port, async () => {
   console.log("Evaluator running on :" + port);
@@ -423,4 +387,3 @@ app.listen(port, async () => {
     console.error("Initial reference load failed:", e.message);
   }
 });
-
