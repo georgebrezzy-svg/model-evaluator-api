@@ -13,24 +13,26 @@ const CLOUD_API_KEY    = process.env.CLOUDINARY_API_KEY;
 const CLOUD_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 const ADMIN_TOKEN      = process.env.ADMIN_TOKEN || "CHANGE_ME";
 
-/* Optional: override automatic folder discovery with a JSON array of folder names
+/* Optional: override automatic folder discovery with JSON array of folder names
    Example: ["Reference Asian Females","Reference Black male","Reference Mixed Female"]
 */
 const REFERENCE_FOLDERS_JSON = process.env.REFERENCE_FOLDERS_JSON || "";
+
+/* Optional: force a specific HF model via env (else we try a list) */
+const HF_MODEL_ENV = process.env.HF_MODEL || "";
 
 /* =========================
    App
    ========================= */
 const app = express();
 app.use(express.json({ limit: "8mb" }));
-app.use(cors({ origin: "*" })); // TODO: replace "*" with your Bubble domain for production
+app.use(cors({ origin: "*" })); // TODO: replace "*" with your Bubble domain(s) for production
 
 /* =========================
    Utilities
    ========================= */
 const clamp = (x, a=0, b=1) => Math.max(a, Math.min(b, x));
 const basicAuth = "Basic " + Buffer.from(`${CLOUD_API_KEY}:${CLOUD_API_SECRET}`).toString("base64");
-const HF_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/openai/clip-vit-base-patch32";
 
 // Parse "82-60-88" → {b:82,w:60,h:88}
 const parseMeas = (mStr) => {
@@ -64,6 +66,12 @@ const heightScoreFactory = ({min, target, max}) => (h) => {
 const embedCache = new Map(); // url -> Float32Array
 const clusters   = [];        // [{label, gender, urls:[...], vecs:[Float32Array]}]
 
+// Preferred models (fast & widely available first)
+const HF_MODELS = [
+  HF_MODEL_ENV || "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
+  "openai/clip-vit-base-patch32"
+];
+
 async function fetchImageBuffer(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`image_fetch_failed:${r.status}`);
@@ -71,8 +79,8 @@ async function fetchImageBuffer(url) {
   return Buffer.from(ab);
 }
 
+// HF may return [tokens][dim] or [dim]; average over tokens if nested
 function poolToVector(jsonOut) {
-  // HF returns [tokens][dim] or [dim]; average over tokens if nested
   if (Array.isArray(jsonOut) && Array.isArray(jsonOut[0])) {
     const rows = jsonOut.length, cols = jsonOut[0].length;
     const v = new Float32Array(cols);
@@ -86,11 +94,9 @@ function poolToVector(jsonOut) {
   return Float32Array.from(jsonOut);
 }
 
-async function getEmbedding(url) {
-  if (embedCache.has(url)) return embedCache.get(url);
-  if (!HF_KEY) throw new Error("HUGGINGFACE_API_KEY missing");
-  const buf = await fetchImageBuffer(url);
-  const resp = await fetch(HF_URL, {
+// POST raw image bytes to a model endpoint and get features back
+async function hfEmbedBinary(modelId, buf) {
+  const resp = await fetch(`https://api-inference.huggingface.co/models/${modelId}`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${HF_KEY}`,
@@ -99,11 +105,34 @@ async function getEmbedding(url) {
     },
     body: buf
   });
-  if (!resp.ok) throw new Error("hf_error:" + (await resp.text()));
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`hf_${resp.status}_${modelId}:${txt || "error"}`);
+  }
   const data = await resp.json();
-  const vec = poolToVector(data);
-  embedCache.set(url, vec);
-  return vec;
+  return poolToVector(data);
+}
+
+async function getEmbedding(url) {
+  if (embedCache.has(url)) return embedCache.get(url);
+  if (!HF_KEY) throw new Error("HUGGINGFACE_API_KEY missing");
+
+  const buf = await fetchImageBuffer(url);
+
+  let lastErr, usedModel = null;
+  for (const mid of HF_MODELS) {
+    try {
+      const vec = await hfEmbedBinary(mid, buf);
+      embedCache.set(url, vec);
+      usedModel = mid;
+      // (Optional) you could log which model succeeded
+      return vec;
+    } catch (e) {
+      lastErr = e;
+      console.error("hf_try_fail", mid, e.message);
+    }
+  }
+  throw lastErr || new Error("hf_all_models_failed");
 }
 
 /* =========================
@@ -185,6 +214,19 @@ app.get("/admin/reload_refs", async (req, res) => {
   }
 });
 
+/* Test one image embedding quickly (debug) */
+app.get("/admin/test_embed", async (req, res) => {
+  if (req.query.token !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const url = req.query.url;
+    if (!url) return res.status(400).json({ error: "missing ?url=" });
+    const vec = await getEmbedding(url);
+    res.json({ ok: true, dim: vec.length, tried_models: HF_MODELS });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 /* Health */
 app.get("/", (_, res) => res.send("OK"));
 
@@ -212,10 +254,10 @@ app.post("/evaluate", async (req, res) => {
         meas_tol:    { b: 6,  w: 4,  h: 6  }
       },
       male: {
-        // ✅ your correction: cap at 191cm, sweet spot around 186
+        // cap at 191cm, sweet spot around 186
         height: { min: 182, target: 186, max: 191 },
 
-        // ✅ accepts slimmer high-fashion builds with an ideal window
+        // accepts slimmer high-fashion builds with an ideal window
         meas_bands: {
           // Bust/Chest: accept 88–96; ideal 90–94
           b: { min: 88, ideal: [90, 94], max: 96 },
@@ -320,7 +362,7 @@ app.post("/evaluate", async (req, res) => {
     const n = parseInt(hash.slice(0, 6), 16);
     const tinyNoise = (n % 100) / 10000;
 
-    /* 6) Combine (weights — feel free to tune) */
+    /* 6) Combine (weights — tune if you like) */
     let confidence =
       0.40 * measScore +
       0.25 * heightScore(height_cm) +
@@ -381,3 +423,4 @@ app.listen(port, async () => {
     console.error("Initial reference load failed:", e.message);
   }
 });
+
