@@ -2,22 +2,40 @@ import express from "express";
 import cors from "cors";
 import crypto from "crypto";
 import fetch from "node-fetch";
+import { pipeline, env as tEnv } from "@xenova/transformers";
 
-/* ========= ENV (Render → Settings → Environment) ========= */
-const KEY              = process.env.EVALUATOR_API_KEY;         // Bubble auth
-const HF_KEY           = process.env.HUGGINGFACE_API_KEY;       // hf_...
-const CLOUD_NAME       = process.env.CLOUDINARY_CLOUD_NAME;     // e.g. dphw7jvyg
+/* ========= ENV (Render → Settings → Environment) =========
+   Required:
+     - EVALUATOR_API_KEY
+     - CLOUDINARY_CLOUD_NAME
+     - CLOUDINARY_API_KEY
+     - CLOUDINARY_API_SECRET
+     - ADMIN_TOKEN
+   Optional:
+     - REFERENCE_FOLDERS_JSON (JSON array of exact folder names)
+     - HF_MODEL  (model id to load, default 'Xenova/clip-vit-base-patch32')
+     - TRANSFORMERS_CACHE (e.g. '/opt/render/project/.cache/transformers')
+=========================================================== */
+
+const KEY              = process.env.EVALUATOR_API_KEY;
+const CLOUD_NAME       = process.env.CLOUDINARY_CLOUD_NAME;     // e.g., dphw7jvyg
 const CLOUD_API_KEY    = process.env.CLOUDINARY_API_KEY;
 const CLOUD_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 const ADMIN_TOKEN      = process.env.ADMIN_TOKEN || "CHANGE_ME";
-/* Optional */
 const REFERENCE_FOLDERS_JSON = process.env.REFERENCE_FOLDERS_JSON || "";
-const HF_MODEL_ENV     = process.env.HF_MODEL || "";            // e.g. sentence-transformers/clip-ViT-B-32
+const CLIP_MODEL_ID    = process.env.HF_MODEL || "Xenova/clip-vit-base-patch32";
+
+// (Optional) where to cache downloaded models on Render
+if (process.env.TRANSFORMERS_CACHE) {
+  tEnv.cacheDir = process.env.TRANSFORMERS_CACHE;
+}
+tEnv.allowLocalModels = false;    // fetch from CDN automatically
+tEnv.backends.onnx.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/@xenova/transformers/dist/";
 
 /* ========= App ========= */
 const app = express();
 app.use(express.json({ limit: "8mb" }));
-app.use(cors({ origin: "*" })); // tighten to your Bubble domain(s) for production
+app.use(cors({ origin: "*" })); // TODO: restrict to your Bubble domain in production
 
 /* ========= Utils ========= */
 const clamp = (x, a=0, b=1) => Math.max(a, Math.min(b, x));
@@ -48,25 +66,20 @@ const heightScoreFactory = ({min, target, max}) => (h) => {
   return clamp(s + bonus);
 };
 
-/* ========= Embeddings (HF) ========= */
+/* ========= Embeddings (local CLIP via @xenova/transformers) ========= */
 const embedCache = new Map();  // url -> Float32Array
 const clusters   = [];         // [{label, gender, urls:[...], vecs:[Float32Array]}]
 
-// Preferred models (we’ll try in order; you can force one with HF_MODEL)
-const HF_MODELS = [
-  HF_MODEL_ENV || "sentence-transformers/clip-ViT-B-32",
-  "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
-  "openai/clip-vit-base-patch32"
-];
+// lazy-load the CLIP extractor once
+let clipExtractorPromise = null;
+async function getClipExtractor() {
+  if (!clipExtractorPromise) {
+    clipExtractorPromise = pipeline("feature-extraction", CLIP_MODEL_ID);
+  }
+  return clipExtractorPromise;
+}
 
-// We’ll try ALL three Inference API routes; different accounts enable different ones
-const HF_ROUTES = (modelId) => [
-  `https://api-inference.huggingface.co/pipeline/image-feature-extraction/${modelId}`,
-  `https://api-inference.huggingface.co/pipeline/feature-extraction/${modelId}`,
-  `https://api-inference.huggingface.co/models/${modelId}`
-];
-
-/* Downscale Cloudinary images to keep HF happy (w_512, jpg, q_auto) */
+/* Downscale using Cloudinary transform to keep bytes small (w=512 jpg) */
 async function fetchImageBuffer(url) {
   let resized = url;
   try {
@@ -75,114 +88,25 @@ async function fetchImageBuffer(url) {
     if (idx !== -1 && !url.includes("/image/upload/f_jpg")) {
       resized = url.slice(0, idx + marker.length) + "f_jpg,q_auto,w_512,c_limit/" + url.slice(idx + marker.length);
     }
-  } catch (_) { /* noop */ }
-
+  } catch (_) {}
   const r = await fetch(resized);
   if (!r.ok) throw new Error(`image_fetch_failed:${r.status}`);
   const ab = await r.arrayBuffer();
   return Buffer.from(ab);
 }
 
-// HF sometimes returns [tokens][dim]; average over tokens.
-// Sometimes it returns a single vector [dim].
-function poolToVector(jsonOut) {
-  if (Array.isArray(jsonOut) && Array.isArray(jsonOut[0])) {
-    const rows = jsonOut.length, cols = jsonOut[0].length;
-    const v = new Float32Array(cols);
-    for (let i=0;i<rows;i++){
-      const row = jsonOut[i];
-      for (let j=0;j<cols;j++) v[j] += row[j];
-    }
-    for (let j=0;j<cols;j++) v[j] /= rows;
-    return v;
-  }
-  return Float32Array.from(jsonOut);
-}
-
-/* === Replace tryEmbed with a dual-mode (json + binary) retrier === */
-async function tryEmbed(route, buf) {
-  const maxAttempts = 3;
-  let last;
-
-  // A) JSON base64 payload (some deployments expect this)
-  const jsonPayload = JSON.stringify({ inputs: buf.toString("base64") });
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    let resp = await fetch(route, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${HF_KEY}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "X-Wait-For-Model": "true"
-      },
-      body: jsonPayload
-    });
-    if (resp.ok) {
-      const data = await resp.json();
-      try { return poolToVector(data); } catch {}
-    } else {
-      const txt = await resp.text();
-      last = new Error(`hf_json_${resp.status}_${route}:${txt || "error"}`);
-      if ([500,502,503,504].includes(resp.status) && attempt < maxAttempts) {
-        await new Promise(r => setTimeout(r, 400 * attempt));
-        continue;
-      }
-    }
-    break; // if JSON path didn’t return ok, try binary next
-  }
-
-  // B) Raw binary (other deployments expect this)
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    let resp = await fetch(route, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${HF_KEY}`,
-        "Content-Type": "application/octet-stream",
-        Accept: "application/json",
-        "X-Wait-For-Model": "true"
-      },
-      body: buf
-    });
-    if (resp.ok) {
-      const data = await resp.json();
-      return poolToVector(data);
-    }
-    const txt = await resp.text();
-    last = new Error(`hf_bin_${resp.status}_${route}:${txt || "error"}`);
-    if ([500,502,503,504].includes(resp.status) && attempt < maxAttempts) {
-      await new Promise(r => setTimeout(r, 400 * attempt));
-      continue;
-    }
-    throw last;
-  }
-  throw last;
-}
-
-/* === Replace getEmbedding to keep everything else the same === */
 async function getEmbedding(url) {
   if (embedCache.has(url)) return embedCache.get(url);
-  if (!HF_KEY) throw new Error("HUGGINGFACE_API_KEY missing");
-
   const buf = await fetchImageBuffer(url);
-  let lastErr;
-
-  for (const model of HF_MODELS) {
-    const routes = HF_ROUTES(model);
-    for (const route of routes) {
-      try {
-        const vec = await tryEmbed(route, buf);
-        embedCache.set(url, vec);
-        return vec;
-      } catch (e) {
-        lastErr = e;
-        console.error("hf_try_fail", model, e.message);
-      }
-    }
-  }
-  throw lastErr || new Error("hf_all_endpoints_failed");
+  const extractor = await getClipExtractor();
+  // pipeline accepts raw bytes; we pool mean & L2-normalize for stable cosine
+  const out = await extractor(buf, { pooling: "mean", normalize: true });
+  const vec = Float32Array.from(out.data);
+  embedCache.set(url, vec);
+  return vec;
 }
 
-/* ========= Cloudinary admin helpers ========= */
+/* ========= Cloudinary helpers ========= */
 async function listRootFolders() {
   const url = `https://api.cloudinary.com/v1_1/${CLOUD_NAME}/folders`;
   const r = await fetch(url, { headers: { Authorization: basicAuth } });
@@ -217,7 +141,7 @@ async function discoverReferenceFolders() {
     catch { throw new Error("Invalid REFERENCE_FOLDERS_JSON"); }
   }
   const names = await listRootFolders();
-  return names.filter(n => /^reference\s/i.test(n)); // starts with "Reference "
+  return names.filter(n => /^reference\s/i.test(n));
 }
 
 async function loadClusters() {
@@ -257,14 +181,13 @@ app.get("/admin/reload_refs", async (req, res) => {
   }
 });
 
-// Test a single image quickly (debug)
 app.get("/admin/test_embed", async (req, res) => {
   if (req.query.token !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
   try {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: "missing ?url=" });
     const vec = await getEmbedding(url);
-    res.json({ ok: true, dim: vec.length, models_tried: HF_MODELS });
+    res.json({ ok: true, dim: vec.length, model: CLIP_MODEL_ID });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
@@ -432,8 +355,10 @@ const port = process.env.PORT || 10000;
 app.listen(port, async () => {
   console.log("Evaluator running on :" + port);
   try {
+    // Preload the model once at boot so the first request isn’t slow
+    await getClipExtractor();
     await loadClusters();
   } catch (e) {
-    console.error("Initial reference load failed:", e.message);
+    console.error("Startup warning:", e.message);
   }
 });
