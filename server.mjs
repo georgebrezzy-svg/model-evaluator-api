@@ -99,12 +99,41 @@ function poolToVector(jsonOut) {
   return Float32Array.from(jsonOut);
 }
 
-/* Try a (route,model) with small retry/backoff on 5xx */
+/* === Replace tryEmbed with a dual-mode (json + binary) retrier === */
 async function tryEmbed(route, buf) {
   const maxAttempts = 3;
   let last;
+
+  // A) JSON base64 payload (some deployments expect this)
+  const jsonPayload = JSON.stringify({ inputs: buf.toString("base64") });
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const resp = await fetch(route, {
+    let resp = await fetch(route, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${HF_KEY}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "X-Wait-For-Model": "true"
+      },
+      body: jsonPayload
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      try { return poolToVector(data); } catch {}
+    } else {
+      const txt = await resp.text();
+      last = new Error(`hf_json_${resp.status}_${route}:${txt || "error"}`);
+      if ([500,502,503,504].includes(resp.status) && attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, 400 * attempt));
+        continue;
+      }
+    }
+    break; // if JSON path didn’t return ok, try binary next
+  }
+
+  // B) Raw binary (other deployments expect this)
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let resp = await fetch(route, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${HF_KEY}`,
@@ -119,8 +148,8 @@ async function tryEmbed(route, buf) {
       return poolToVector(data);
     }
     const txt = await resp.text();
-    last = new Error(`hf_${resp.status}_${route}:${txt || "error"}`);
-    if ([500, 502, 503, 504].includes(resp.status) && attempt < maxAttempts) {
+    last = new Error(`hf_bin_${resp.status}_${route}:${txt || "error"}`);
+    if ([500,502,503,504].includes(resp.status) && attempt < maxAttempts) {
       await new Promise(r => setTimeout(r, 400 * attempt));
       continue;
     }
@@ -129,6 +158,7 @@ async function tryEmbed(route, buf) {
   throw last;
 }
 
+/* === Replace getEmbedding to keep everything else the same === */
 async function getEmbedding(url) {
   if (embedCache.has(url)) return embedCache.get(url);
   if (!HF_KEY) throw new Error("HUGGINGFACE_API_KEY missing");
