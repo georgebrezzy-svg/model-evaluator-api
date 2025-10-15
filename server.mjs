@@ -12,12 +12,12 @@ const CLOUD_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 const ADMIN_TOKEN      = process.env.ADMIN_TOKEN || "CHANGE_ME";
 /* Optional */
 const REFERENCE_FOLDERS_JSON = process.env.REFERENCE_FOLDERS_JSON || "";
-const HF_MODEL_ENV     = process.env.HF_MODEL || "";            // to force a specific model
+const HF_MODEL_ENV     = process.env.HF_MODEL || "";            // e.g. sentence-transformers/clip-ViT-B-32
 
 /* ========= App ========= */
 const app = express();
 app.use(express.json({ limit: "8mb" }));
-app.use(cors({ origin: "*" })); // tighten to your Bubble domain later
+app.use(cors({ origin: "*" })); // tighten to your Bubble domain(s) for production
 
 /* ========= Utils ========= */
 const clamp = (x, a=0, b=1) => Math.max(a, Math.min(b, x));
@@ -52,22 +52,32 @@ const heightScoreFactory = ({min, target, max}) => (h) => {
 const embedCache = new Map();  // url -> Float32Array
 const clusters   = [];         // [{label, gender, urls:[...], vecs:[Float32Array]}]
 
-// Reliable CLIP variants (we’ll try them in order)
+// Preferred models (we’ll try in order; you can force one with HF_MODEL)
 const HF_MODELS = [
   HF_MODEL_ENV || "sentence-transformers/clip-ViT-B-32",
   "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
   "openai/clip-vit-base-patch32"
 ];
 
-// We’ll try ALL three Inference API routes, because different accounts/regions enable different ones
+// We’ll try ALL three Inference API routes; different accounts enable different ones
 const HF_ROUTES = (modelId) => [
   `https://api-inference.huggingface.co/pipeline/image-feature-extraction/${modelId}`,
   `https://api-inference.huggingface.co/pipeline/feature-extraction/${modelId}`,
   `https://api-inference.huggingface.co/models/${modelId}`
 ];
 
+/* Downscale Cloudinary images to keep HF happy (w_512, jpg, q_auto) */
 async function fetchImageBuffer(url) {
-  const r = await fetch(url);
+  let resized = url;
+  try {
+    const marker = "/image/upload/";
+    const idx = url.indexOf(marker);
+    if (idx !== -1 && !url.includes("/image/upload/f_jpg")) {
+      resized = url.slice(0, idx + marker.length) + "f_jpg,q_auto,w_512,c_limit/" + url.slice(idx + marker.length);
+    }
+  } catch (_) { /* noop */ }
+
+  const r = await fetch(resized);
   if (!r.ok) throw new Error(`image_fetch_failed:${r.status}`);
   const ab = await r.arrayBuffer();
   return Buffer.from(ab);
@@ -89,24 +99,34 @@ function poolToVector(jsonOut) {
   return Float32Array.from(jsonOut);
 }
 
-// Try a single (route, model) pair with warm-up
+/* Try a (route,model) with small retry/backoff on 5xx */
 async function tryEmbed(route, buf) {
-  const resp = await fetch(route, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${HF_KEY}`,
-      "Content-Type": "application/octet-stream",
-      Accept: "application/json",
-      "X-Wait-For-Model": "true"
-    },
-    body: buf
-  });
-  if (!resp.ok) {
+  const maxAttempts = 3;
+  let last;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const resp = await fetch(route, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${HF_KEY}`,
+        "Content-Type": "application/octet-stream",
+        Accept: "application/json",
+        "X-Wait-For-Model": "true"
+      },
+      body: buf
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      return poolToVector(data);
+    }
     const txt = await resp.text();
-    throw new Error(`hf_${resp.status}_${route}:${txt || "error"}`);
+    last = new Error(`hf_${resp.status}_${route}:${txt || "error"}`);
+    if ([500, 502, 503, 504].includes(resp.status) && attempt < maxAttempts) {
+      await new Promise(r => setTimeout(r, 400 * attempt));
+      continue;
+    }
+    throw last;
   }
-  const data = await resp.json();
-  return poolToVector(data);
+  throw last;
 }
 
 async function getEmbedding(url) {
@@ -207,7 +227,7 @@ app.get("/admin/reload_refs", async (req, res) => {
   }
 });
 
-// test a single image quickly (debug)
+// Test a single image quickly (debug)
 app.get("/admin/test_embed", async (req, res) => {
   if (req.query.token !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
   try {
