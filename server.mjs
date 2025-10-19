@@ -365,11 +365,35 @@ app.post("/evaluate", async (req, res) => {
     console.error(e);
     return res.status(500).json({ error: "server_error", message: String(e?.message || e) });
   }
-}); app.get("/", (_req, res) => res.send("OK"));
+}); app.get("/", (_req, res) => res.send("OK")); app.get("/admin/warmup", async (req, res) => {
+  if (req.query.token !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    // just load the model once; no Cloudinary fetch
+    const extractor = await (await import("@xenova/transformers")).pipeline("feature-extraction", CLIP_MODEL_ID);
+    // touch it once so weights are fully cached
+    await extractor(new Uint8Array([0,1,2,3]), { pooling: "mean", normalize: true }).catch(() => {});
+    return res.json({ ok: true, warmed: true, model: CLIP_MODEL_ID });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 
 
 /* ================= Boot ================= */
 const port = process.env.PORT || 10000;
 app.listen(port, () => {
   console.log("Evaluator running on :" + port, "(lightweight mode)");
+  // background warm-up (doesn't block requests)
+  setTimeout(async () => {
+    try {
+      const { pipeline } = await import("@xenova/transformers");
+      const extractor = await pipeline("feature-extraction", CLIP_MODEL_ID);
+      // tiny dummy call to ensure wasm+weights are cached
+      await extractor(new Uint8Array([0,1,2,3]), { pooling: "mean", normalize: true }).catch(() => {});
+      console.log("Model warm-up complete");
+    } catch (e) {
+      console.log("Model warm-up skipped:", e?.message || e);
+    }
+  }, 2000);
 });
