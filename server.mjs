@@ -4,40 +4,41 @@ import crypto from "crypto";
 import fetch from "node-fetch";
 import { pipeline, env as tEnv } from "@xenova/transformers";
 
-/* ========= ENV (Render → Settings → Environment) =========
-   Required:
-     - EVALUATOR_API_KEY
-     - CLOUDINARY_CLOUD_NAME
-     - CLOUDINARY_API_KEY
-     - CLOUDINARY_API_SECRET
-     - ADMIN_TOKEN
-   Optional:
-     - REFERENCE_FOLDERS_JSON (JSON array of exact folder names)
-     - HF_MODEL  (model id to load, default 'Xenova/clip-vit-base-patch32')
-     - TRANSFORMERS_CACHE (e.g. '/opt/render/project/.cache/transformers')
-=========================================================== */
+/* ======== ENV (Render → Settings → Environment) ========
+Required:
+  EVALUATOR_API_KEY
+  CLOUDINARY_CLOUD_NAME
+  CLOUDINARY_API_KEY
+  CLOUDINARY_API_SECRET
+  ADMIN_TOKEN
+Optional:
+  REFERENCE_FOLDERS_JSON   (JSON array of exact folder names)
+  HF_MODEL                 (default 'Xenova/clip-vit-base-patch32')
+  TRANSFORMERS_CACHE       (e.g. '/opt/render/project/.cache/transformers')
+  MAX_REFS_PER_FOLDER      (default 40)
+  MAX_EMBEDS_CONCURRENCY   (default 2)
+======================================================== */
 
 const KEY              = process.env.EVALUATOR_API_KEY;
-const CLOUD_NAME       = process.env.CLOUDINARY_CLOUD_NAME;     // e.g., dphw7jvyg
+const CLOUD_NAME       = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUD_API_KEY    = process.env.CLOUDINARY_API_KEY;
 const CLOUD_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 const ADMIN_TOKEN      = process.env.ADMIN_TOKEN || "CHANGE_ME";
 const REFERENCE_FOLDERS_JSON = process.env.REFERENCE_FOLDERS_JSON || "";
 const CLIP_MODEL_ID    = process.env.HF_MODEL || "Xenova/clip-vit-base-patch32";
+const MAX_REFS_PER_FOLDER = Number(process.env.MAX_REFS_PER_FOLDER || 40);
+const MAX_EMBEDS_CONCURRENCY = Number(process.env.MAX_EMBEDS_CONCURRENCY || 2);
 
-// (Optional) where to cache downloaded models on Render
-if (process.env.TRANSFORMERS_CACHE) {
-  tEnv.cacheDir = process.env.TRANSFORMERS_CACHE;
-}
-tEnv.allowLocalModels = false;    // fetch from CDN automatically
+// Optional: cache directory for model weights (survives restarts on Render)
+if (process.env.TRANSFORMERS_CACHE) tEnv.cacheDir = process.env.TRANSFORMERS_CACHE;
+tEnv.allowLocalModels = false;
 tEnv.backends.onnx.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/@xenova/transformers/dist/";
 
-/* ========= App ========= */
 const app = express();
 app.use(express.json({ limit: "8mb" }));
-app.use(cors({ origin: "*" })); // TODO: restrict to your Bubble domain in production
+app.use(cors({ origin: "*" })); // tighten to Bubble domain in prod
 
-/* ========= Utils ========= */
+/* ================= Utils ================= */
 const clamp = (x, a=0, b=1) => Math.max(a, Math.min(b, x));
 const basicAuth = "Basic " + Buffer.from(`${CLOUD_API_KEY}:${CLOUD_API_SECRET}`).toString("base64");
 
@@ -66,11 +67,7 @@ const heightScoreFactory = ({min, target, max}) => (h) => {
   return clamp(s + bonus);
 };
 
-/* ========= Embeddings (local CLIP via @xenova/transformers) ========= */
-const embedCache = new Map();  // url -> Float32Array
-const clusters   = [];         // [{label, gender, urls:[...], vecs:[Float32Array]}]
-
-// lazy-load the CLIP extractor once
+/* ============ Embeddings (local CLIP) ============ */
 let clipExtractorPromise = null;
 async function getClipExtractor() {
   if (!clipExtractorPromise) {
@@ -79,7 +76,7 @@ async function getClipExtractor() {
   return clipExtractorPromise;
 }
 
-/* Downscale using Cloudinary transform to keep bytes small (w=512 jpg) */
+/* Downscale via Cloudinary to keep memory low */
 async function fetchImageBuffer(url) {
   let resized = url;
   try {
@@ -88,25 +85,21 @@ async function fetchImageBuffer(url) {
     if (idx !== -1 && !url.includes("/image/upload/f_jpg")) {
       resized = url.slice(0, idx + marker.length) + "f_jpg,q_auto,w_512,c_limit/" + url.slice(idx + marker.length);
     }
-  } catch (_) {}
+  } catch(_) {}
   const r = await fetch(resized);
   if (!r.ok) throw new Error(`image_fetch_failed:${r.status}`);
   const ab = await r.arrayBuffer();
   return Buffer.from(ab);
 }
 
-async function getEmbedding(url) {
-  if (embedCache.has(url)) return embedCache.get(url);
+async function embedOne(url) {
   const buf = await fetchImageBuffer(url);
   const extractor = await getClipExtractor();
-  // pipeline accepts raw bytes; we pool mean & L2-normalize for stable cosine
   const out = await extractor(buf, { pooling: "mean", normalize: true });
-  const vec = Float32Array.from(out.data);
-  embedCache.set(url, vec);
-  return vec;
+  return Float32Array.from(out.data);
 }
 
-/* ========= Cloudinary helpers ========= */
+/* ======= Cloudinary helpers ======= */
 async function listRootFolders() {
   const url = `https://api.cloudinary.com/v1_1/${CLOUD_NAME}/folders`;
   const r = await fetch(url, { headers: { Authorization: basicAuth } });
@@ -135,6 +128,9 @@ function inferGenderFromFolder(name) {
   return "unknown";
 }
 
+/* ======= Memory-light reference loading (centroids only) ======= */
+const clusters = []; // [{ label, gender, size, centroid: Float32Array }]
+
 async function discoverReferenceFolders() {
   if (REFERENCE_FOLDERS_JSON.trim()) {
     try { return JSON.parse(REFERENCE_FOLDERS_JSON); }
@@ -150,30 +146,57 @@ async function loadClusters() {
   }
   const folderNames = await discoverReferenceFolders();
   const out = [];
+
   for (const fname of folderNames) {
-    const urls = await searchFolderAssets(fname);
-    if (!urls.length) continue;
+    const urlsAll = await searchFolderAssets(fname);
+    if (!urlsAll.length) continue;
+
+    // sample first MAX_REFS_PER_FOLDER (or randomize if you prefer)
+    const urls = urlsAll.slice(0, MAX_REFS_PER_FOLDER);
     const gender = inferGenderFromFolder(fname);
-    const vecs = [];
-    for (const u of urls) {
-      try { vecs.push(await getEmbedding(u)); }
-      catch (e) { console.error("embed_fail", fname, u, e.message); }
+
+    // Streaming centroid: sum vectors then divide → no need to store each vec
+    let centroid = null;
+    let count = 0;
+
+    // tiny concurrency limiter
+    const queue = [...urls];
+    const workers = Array(Math.min(MAX_EMBEDS_CONCURRENCY, urls.length)).fill(0).map(async () => {
+      while (queue.length) {
+        const u = queue.shift();
+        try {
+          const v = await embedOne(u);
+          if (!centroid) centroid = new Float32Array(v.length);
+          for (let i=0;i<v.length;i++) centroid[i] += v[i];
+          count++;
+        } catch (e) {
+          console.error("embed_fail", fname, u, e.message);
+        }
+      }
+    });
+    await Promise.all(workers);
+
+    if (count > 0) {
+      for (let i=0;i<centroid.length;i++) centroid[i] /= count;
+      out.push({ label: fname, gender, size: count, centroid });
     }
-    if (vecs.length) out.push({ label: fname, gender, urls, vecs });
+    // important: let GC reclaim buffers from this folder before moving on
+    global.gc?.();
   }
+
   clusters.length = 0;
   clusters.push(...out);
-  console.log("Loaded clusters:", clusters.map(c => `${c.label}(${c.vecs.length})`).join(", "));
+  console.log("Loaded centroids:", clusters.map(c => `${c.label}(${c.size})`).join(", "));
 }
 
-/* ========= Admin endpoints ========= */
+/* =============== Admin endpoints =============== */
 app.get("/admin/reload_refs", async (req, res) => {
   if (req.query.token !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
   try {
     await loadClusters();
     res.json({
       ok: true,
-      clusters: clusters.map(c => ({ label: c.label, gender: c.gender, size: c.vecs.length }))
+      clusters: clusters.map(c => ({ label: c.label, gender: c.gender, size: c.size }))
     });
   } catch (e) {
     console.error(e);
@@ -186,17 +209,14 @@ app.get("/admin/test_embed", async (req, res) => {
   try {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: "missing ?url=" });
-    const vec = await getEmbedding(url);
+    const vec = await embedOne(url);
     res.json({ ok: true, dim: vec.length, model: CLIP_MODEL_ID });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-/* ========= Health ========= */
-app.get("/", (_, res) => res.send("OK"));
-
-/* ========= Evaluate ========= */
+/* ================= Evaluate ================= */
 app.post("/evaluate", async (req, res) => {
   try {
     const auth = req.headers.authorization || "";
@@ -209,12 +229,12 @@ app.post("/evaluate", async (req, res) => {
       return res.status(400).json({ error: "`photos` must be a non-empty array of URLs" });
     }
 
-    // Preferences (female target/tolerance; male bands)
+    // Preferences
     const PREFS = {
       female: {
         height: { min: 172, target: 177, max: 182 },
         meas_target: { b: 82, w: 60, h: 88 },
-        meas_tol:    { b: 6,  w: 4,  h: 6  }
+        meas_tol:    { b: 6,  w: 4,  h: 6 }
       },
       male: {
         height: { min: 182, target: 186, max: 191 },
@@ -229,9 +249,9 @@ app.post("/evaluate", async (req, res) => {
     const GEN = (gender || "female").toLowerCase().startsWith("m") ? "male" : "female";
     const P   = PREFS[GEN];
     const heightScore = heightScoreFactory(P.height);
-
-    // Measurements score
     const m = parseMeas(measurements);
+
+    // male band scoring
     const bandScore = (val, band) => {
       if (val == null || !band) return 0;
       const v = Number(val);
@@ -241,6 +261,7 @@ app.post("/evaluate", async (req, res) => {
       if (v <  ideal[0]) return (v - min) / (ideal[0] - min);
       return (max - v) / (max - ideal[1]);
     };
+
     let measScore = 0;
     if (GEN === "male" && P.meas_bands && m) {
       const sB = bandScore(m.b, P.meas_bands.b);
@@ -258,39 +279,36 @@ app.post("/evaluate", async (req, res) => {
       const sW = clamp(1 - dxW);
       const sH = clamp(1 - dxH);
       measScore = clamp((sB + 1.2*sW + sH) / 3.2);
-    } else {
-      measScore = 0;
     }
 
-    // Face similarity
+    // Face similarity vs centroids (average applicant vector vs folder centroids)
     let faceScore = 0.5, faceCluster = "none", faceReason = "face similarity neutral";
     try {
       if (clusters.length) {
-        const pool = clusters.some(c => c.gender !== "unknown")
-          ? clusters.filter(c => c.gender === GEN || c.gender === "unknown")
-          : clusters;
-
+        // Embed applicant photos (sequential to keep RAM low)
         const photoVecs = [];
-        for (const url of photos) {
-          try { photoVecs.push(await getEmbedding(url)); }
+        for (const url of photos.slice(0, 5)) { // hard cap 5 photos for RAM
+          try { photoVecs.push(await embedOne(url)); }
           catch (e) { console.error("app_embed_fail", url, e.message); }
         }
+        if (photoVecs.length) {
+          const dim = photoVecs[0].length;
+          const avg = new Float32Array(dim);
+          for (const v of photoVecs) for (let i=0;i<dim;i++) avg[i] += v[i];
+          for (let i=0;i<dim;i++) avg[i] /= photoVecs.length;
 
-        let maxSim = -1, bestLabel = "none";
-        for (const pv of photoVecs) {
-          for (const c of pool) {
-            for (const rv of c.vecs) {
-              const s = cosine(pv, rv);
-              if (s > maxSim) { maxSim = s; bestLabel = c.label; }
-            }
+          let maxSim = -1, bestLabel = "none";
+          for (const c of clusters) {
+            const s = cosine(avg, c.centroid);
+            if (s > maxSim) { maxSim = s; bestLabel = c.label; }
           }
-        }
-        if (maxSim >= -1) {
           faceScore = clamp((maxSim + 1) / 2);
           faceCluster = bestLabel;
           if (faceScore >= 0.70) faceReason = "face matches reference look";
           else if (faceScore >= 0.55) faceReason = "some similarity to reference look";
           else faceReason = "low similarity to reference look";
+        } else {
+          faceReason = "no valid photos to analyze";
         }
       } else {
         faceReason = "no reference faces loaded";
@@ -301,14 +319,13 @@ app.post("/evaluate", async (req, res) => {
       faceScore = 0.5;
     }
 
-    // Photo count + tiny noise
+    // extras
     const nPhotos = photos.length;
     const photoBoost = clamp((nPhotos - 2) * 0.04, 0, 0.12);
     const hash = crypto.createHash("sha256").update(photos.join("|")).digest("hex");
     const n = parseInt(hash.slice(0, 6), 16);
     const tinyNoise = (n % 100) / 10000;
 
-    // Combine
     let confidence =
       0.40 * measScore +
       0.25 * heightScore(height_cm) +
@@ -350,15 +367,8 @@ app.post("/evaluate", async (req, res) => {
   }
 });
 
-/* ========= Boot ========= */
+/* ================= Boot ================= */
 const port = process.env.PORT || 10000;
-app.listen(port, async () => {
-  console.log("Evaluator running on :" + port);
-  try {
-    // Preload the model once at boot so the first request isn’t slow
-    await getClipExtractor();
-    await loadClusters();
-  } catch (e) {
-    console.error("Startup warning:", e.message);
-  }
+app.listen(port, () => {
+  console.log("Evaluator running on :" + port, "(lightweight mode)");
 });
