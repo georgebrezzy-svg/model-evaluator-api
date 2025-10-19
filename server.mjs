@@ -365,7 +365,8 @@ app.post("/evaluate", async (req, res) => {
     console.error(e);
     return res.status(500).json({ error: "server_error", message: String(e?.message || e) });
   }
-});
+}); app.get("/", (_req, res) => res.send("OK"));
+
 
 /* ================= Boot ================= */
 const port = process.env.PORT || 10000;
