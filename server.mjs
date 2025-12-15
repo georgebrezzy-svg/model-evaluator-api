@@ -35,8 +35,10 @@ tEnv.allowLocalModels = false;
 tEnv.backends.onnx.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/@xenova/transformers/dist/";
 
 const app = express();
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "2mb" }));
 app.use(cors({ origin: "*" })); // tighten to Bubble domain in prod
+app.get("/ping", (req, res) => res.json({ ok: true }));
+
 
 /* ================= Utils ================= */
 const clamp = (x, a=0, b=1) => Math.max(a, Math.min(b, x));
@@ -382,6 +384,26 @@ app.post("/evaluate", async (req, res) => {
 
 /* ================= Boot ================= */
 const port = process.env.PORT || 10000;
+app.post("/evaluate_mock", (req, res) => {
+  const body = req.body ?? {};
+  let { photos = [], gender = "", height_cm = "", age = "", measurements = "" } = body;
+
+  if (typeof photos === "string") {
+    photos = photos.split(",").map(s => s.trim()).filter(Boolean);
+  }
+  const detailsArr = Array.isArray(photos) ? photos.slice(0, 2) : [];
+  const details_text = detailsArr.join("; ");
+
+  return res.status(200).json({
+    decision: "review",
+    confidence: 0.75,
+    reason: "Endpoint OK; mock evaluation response.",
+    details: detailsArr.map(u => ({ url: u, desc: "provided", best_similarity: 0.0 })),
+    details_text,
+    parsed_measurements_cm: null
+  });
+});
+
 app.listen(port, () => {
   console.log("Evaluator running on :" + port, "(lightweight mode)");
   // background warm-up (doesn't block requests)
